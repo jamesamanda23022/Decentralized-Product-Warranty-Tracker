@@ -211,3 +211,76 @@
     (ok true)
   )
 )
+
+
+(define-map serial-to-warranty
+    (string-ascii 64)
+    uint)
+
+(define-read-only (get-warranty-by-serial 
+    (product-serial (string-ascii 64)))
+    (match (map-get? serial-to-warranty product-serial)
+        warranty-id (get-warranty-details warranty-id)
+        none))
+
+(define-public (update-register-product 
+    (product-id (string-ascii 64))
+    (product-name (string-ascii 64))
+    (product-serial (string-ascii 64))
+    (warranty-duration uint)
+    (warranty-terms (string-utf8 256))
+    (transferable bool))
+    (let
+        ((warranty-id (try! (register-product 
+            product-id
+            product-name
+            product-serial
+            warranty-duration
+            warranty-terms
+            transferable))))
+        (map-set serial-to-warranty product-serial warranty-id)
+        (ok warranty-id)))
+
+
+  
+
+(define-constant WARRANTY_EXTENSION_COST u1000000)
+
+(define-map warranty-renewals
+    uint
+    (list 5 {
+        extension-duration: uint,
+        payment-amount: uint,
+        renewal-date: uint
+    }))
+
+(define-read-only (get-warranty-renewals (warranty-id uint))
+    (map-get? warranty-renewals warranty-id))
+
+(define-public (renew-warranty-with-payment 
+    (warranty-id uint) 
+    (extension-duration uint))
+    (let
+        ((warranty-info (unwrap! (map-get? warranty-details warranty-id) (err u2)))
+         (current-owner (unwrap! (nft-get-owner? warranty warranty-id) (err u3)))
+         (renewal-history (default-to (list) (map-get? warranty-renewals warranty-id)))
+         (payment-amount WARRANTY_EXTENSION_COST))
+        
+        (asserts! (is-eq tx-sender current-owner) (err u4))
+        (asserts! (get active warranty-info) (err u6))
+        (asserts! (<= (len renewal-history) u5) (err u15))
+        
+        (try! (stx-transfer? payment-amount tx-sender (get manufacturer warranty-info)))
+        (try! (extend-warranty warranty-id extension-duration))
+        
+        (map-set warranty-renewals warranty-id
+            (unwrap! (as-max-len? 
+                (append renewal-history {
+                    extension-duration: extension-duration,
+                    payment-amount: payment-amount,
+                    renewal-date: stacks-block-height
+                }) 
+                u5) 
+                (err u16)))
+        
+        (ok true)))
