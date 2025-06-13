@@ -284,3 +284,143 @@
                 (err u16)))
         
         (ok true)))
+
+
+
+(define-constant CLAIM_STATUS_PENDING u1)
+(define-constant CLAIM_STATUS_APPROVED u2)
+(define-constant CLAIM_STATUS_REJECTED u3)
+(define-constant CLAIM_STATUS_COMPLETED u4)
+
+(define-constant CLAIM_TYPE_REPAIR u1)
+(define-constant CLAIM_TYPE_REPLACEMENT u2)
+(define-constant CLAIM_TYPE_REFUND u3)
+
+(define-data-var claim-id-nonce uint u0)
+
+(define-map warranty-claims
+    uint
+    {
+        warranty-id: uint,
+        claimant: principal,
+        claim-type: uint,
+        description: (string-utf8 500),
+        claim-amount: uint,
+        status: uint,
+        filed-date: uint,
+        processed-date: (optional uint),
+        processor: (optional principal),
+        resolution-notes: (optional (string-utf8 500))
+    })
+
+(define-map warranty-claim-history
+    uint
+    (list 10 uint))
+
+(define-read-only (get-claim-details (claim-id uint))
+    (map-get? warranty-claims claim-id))
+
+(define-read-only (get-warranty-claims (warranty-id uint))
+    (map-get? warranty-claim-history warranty-id))
+
+(define-read-only (get-last-claim-id)
+    (var-get claim-id-nonce))
+
+(define-public (file-warranty-claim
+    (warranty-id uint)
+    (claim-type uint)
+    (description (string-utf8 500))
+    (claim-amount uint))
+    (let
+        ((warranty-info (unwrap! (map-get? warranty-details warranty-id) (err u2)))
+         (current-owner (unwrap! (nft-get-owner? warranty warranty-id) (err u3)))
+         (claim-id (+ (var-get claim-id-nonce) u1))
+         (warranty-claims-list (default-to (list) (map-get? warranty-claim-history warranty-id))))
+        
+        (asserts! (is-eq tx-sender current-owner) (err u4))
+        (asserts! (get active warranty-info) (err u6))
+        (asserts! (<= stacks-block-height (get expiry-date warranty-info)) (err u7))
+        (asserts! (and (>= claim-type u1) (<= claim-type u3)) (err u17))
+        (asserts! (> claim-amount u0) (err u18))
+        (asserts! (< (len warranty-claims-list) u10) (err u19))
+        
+        (map-set warranty-claims claim-id
+            {
+                warranty-id: warranty-id,
+                claimant: tx-sender,
+                claim-type: claim-type,
+                description: description,
+                claim-amount: claim-amount,
+                status: CLAIM_STATUS_PENDING,
+                filed-date: stacks-block-height,
+                processed-date: none,
+                processor: none,
+                resolution-notes: none
+            })
+        
+        (map-set warranty-claim-history warranty-id
+            (unwrap! (as-max-len? (append warranty-claims-list claim-id) u10) (err u20)))
+        
+        (var-set claim-id-nonce claim-id)
+        (ok claim-id)))
+
+(define-public (process-warranty-claim
+    (claim-id uint)
+    (approve bool)
+    (resolution-notes (string-utf8 500)))
+    (let
+        ((claim-info (unwrap! (map-get? warranty-claims claim-id) (err u21)))
+         (warranty-info (unwrap! (map-get? warranty-details (get warranty-id claim-info)) (err u2)))
+         (new-status (if approve CLAIM_STATUS_APPROVED CLAIM_STATUS_REJECTED)))
+        
+        (asserts! (is-eq tx-sender (get manufacturer warranty-info)) (err u8))
+        (asserts! (is-eq (get status claim-info) CLAIM_STATUS_PENDING) (err u22))
+        
+        (map-set warranty-claims claim-id
+            (merge claim-info {
+                status: new-status,
+                processed-date: (some stacks-block-height),
+                processor: (some tx-sender),
+                resolution-notes: (some resolution-notes)
+            }))
+        
+        (ok true)))
+
+(define-public (complete-warranty-claim (claim-id uint))
+    (let
+        ((claim-info (unwrap! (map-get? warranty-claims claim-id) (err u21)))
+         (warranty-info (unwrap! (map-get? warranty-details (get warranty-id claim-info)) (err u2))))
+        
+        (asserts! (is-eq tx-sender (get manufacturer warranty-info)) (err u8))
+        (asserts! (is-eq (get status claim-info) CLAIM_STATUS_APPROVED) (err u23))
+        
+        (if (is-eq (get claim-type claim-info) CLAIM_TYPE_REFUND)
+            (try! (stx-transfer? (get claim-amount claim-info) tx-sender (get claimant claim-info)))
+            true)
+        
+        (map-set warranty-claims claim-id
+            (merge claim-info {status: CLAIM_STATUS_COMPLETED}))
+        
+        (ok true)))
+
+(define-read-only (get-pending-claims-for-manufacturer (manufacturer principal))
+    (let
+        ((manufacturer-products-list (default-to (list) (map-get? manufacturer-products manufacturer))))
+        (fold check-product-claims manufacturer-products-list (list))))
+
+(define-private (check-product-claims (product-id (string-ascii 64)) (acc (list 100 uint)))
+    (let
+        ((product-warranties-list (default-to (list) (map-get? product-warranties product-id))))
+        (fold check-warranty-claims product-warranties-list acc)))
+
+(define-private (check-warranty-claims (warranty-id uint) (acc (list 100 uint)))
+    (let
+        ((warranty-claims-list (default-to (list) (map-get? warranty-claim-history warranty-id))))
+        (fold add-pending-claim warranty-claims-list acc)))
+
+(define-private (add-pending-claim (claim-id uint) (acc (list 100 uint)))
+    (match (map-get? warranty-claims claim-id)
+        claim-info (if (is-eq (get status claim-info) CLAIM_STATUS_PENDING)
+                      (unwrap-panic (as-max-len? (append acc claim-id) u100))
+                      acc)
+        acc))
