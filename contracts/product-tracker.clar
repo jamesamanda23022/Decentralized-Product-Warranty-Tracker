@@ -9,6 +9,36 @@
 
 (define-data-var warranty-id-nonce uint u0)
 
+
+(define-constant TIER_BASIC u1)
+(define-constant TIER_PREMIUM u2)
+(define-constant TIER_PLATINUM u3)
+
+(define-data-var tier-id-nonce uint u0)
+
+(define-map warranty-tiers
+    uint
+    {
+        tier-name: (string-ascii 32),
+        tier-level: uint,
+        base-price: uint,
+        coverage-multiplier: uint,
+        max-claim-amount: uint,
+        priority-support: bool,
+        replacement-guarantee: bool,
+        manufacturer: principal,
+        active: bool
+    })
+
+(define-map manufacturer-tiers
+    principal
+    (list 10 uint))
+
+(define-map product-tier-pricing
+    {product-id: (string-ascii 64), tier-id: uint}
+    uint)
+
+
 (define-map warranty-details
   uint
   {
@@ -424,3 +454,118 @@
                       (unwrap-panic (as-max-len? (append acc claim-id) u100))
                       acc)
         acc))
+
+(define-read-only (get-tier-details (tier-id uint))
+    (map-get? warranty-tiers tier-id))
+
+(define-read-only (get-manufacturer-tiers (manufacturer principal))
+    (map-get? manufacturer-tiers manufacturer))
+
+(define-read-only (get-product-tier-price (product-id (string-ascii 64)) (tier-id uint))
+    (map-get? product-tier-pricing {product-id: product-id, tier-id: tier-id}))
+
+(define-read-only (get-last-tier-id)
+    (var-get tier-id-nonce))
+
+(define-public (create-warranty-tier
+    (tier-name (string-ascii 32))
+    (tier-level uint)
+    (base-price uint)
+    (coverage-multiplier uint)
+    (max-claim-amount uint)
+    (priority-support bool)
+    (replacement-guarantee bool))
+    (let
+        ((tier-id (+ (var-get tier-id-nonce) u1))
+         (manufacturer-tier-list (default-to (list) (map-get? manufacturer-tiers tx-sender))))
+        
+        (asserts! (and (>= tier-level u1) (<= tier-level u3)) (err u30))
+        (asserts! (> base-price u0) (err u31))
+        (asserts! (> coverage-multiplier u0) (err u32))
+        (asserts! (> max-claim-amount u0) (err u33))
+        (asserts! (< (len manufacturer-tier-list) u10) (err u34))
+        
+        (map-set warranty-tiers tier-id
+            {
+                tier-name: tier-name,
+                tier-level: tier-level,
+                base-price: base-price,
+                coverage-multiplier: coverage-multiplier,
+                max-claim-amount: max-claim-amount,
+                priority-support: priority-support,
+                replacement-guarantee: replacement-guarantee,
+                manufacturer: tx-sender,
+                active: true
+            })
+        
+        (map-set manufacturer-tiers tx-sender
+            (unwrap! (as-max-len? (append manufacturer-tier-list tier-id) u10) (err u35)))
+        
+        (var-set tier-id-nonce tier-id)
+        (ok tier-id)))
+
+(define-public (set-product-tier-pricing
+    (product-id (string-ascii 64))
+    (tier-id uint)
+    (price uint))
+    (let
+        ((tier-info (unwrap! (map-get? warranty-tiers tier-id) (err u36))))
+        
+        (asserts! (is-eq tx-sender (get manufacturer tier-info)) (err u8))
+        (asserts! (get active tier-info) (err u37))
+        (asserts! (> price u0) (err u38))
+        
+        (map-set product-tier-pricing {product-id: product-id, tier-id: tier-id} price)
+        (ok true)))
+
+(define-public (purchase-warranty-tier
+    (product-id (string-ascii 64))
+    (product-name (string-ascii 64))
+    (product-serial (string-ascii 64))
+    (warranty-duration uint)
+    (warranty-terms (string-utf8 256))
+    (transferable bool)
+    (tier-id uint))
+    (let
+        ((tier-info (unwrap! (map-get? warranty-tiers tier-id) (err u36)))
+         (tier-price (unwrap! (map-get? product-tier-pricing {product-id: product-id, tier-id: tier-id}) (err u39)))
+         (enhanced-duration (* warranty-duration (get coverage-multiplier tier-info)))
+         (enhanced-terms warranty-terms))
+        
+        (asserts! (get active tier-info) (err u37))
+        (asserts! (>= (stx-get-balance tx-sender) tier-price) (err u40))
+        
+        (try! (stx-transfer? tier-price tx-sender (get manufacturer tier-info)))
+        
+        (update-register-product
+            product-id
+            product-name
+            product-serial
+            enhanced-duration
+            enhanced-terms
+            transferable)))
+
+(define-public (deactivate-warranty-tier (tier-id uint))
+    (let
+        ((tier-info (unwrap! (map-get? warranty-tiers tier-id) (err u36))))
+        
+        (asserts! (is-eq tx-sender (get manufacturer tier-info)) (err u8))
+        
+        (map-set warranty-tiers tier-id
+            (merge tier-info {active: false}))
+        
+        (ok true)))
+
+(define-public (update-tier-pricing
+    (tier-id uint)
+    (new-base-price uint))
+    (let
+        ((tier-info (unwrap! (map-get? warranty-tiers tier-id) (err u36))))
+        
+        (asserts! (is-eq tx-sender (get manufacturer tier-info)) (err u8))
+        (asserts! (> new-base-price u0) (err u31))
+        
+        (map-set warranty-tiers tier-id
+            (merge tier-info {base-price: new-base-price}))
+        
+        (ok true)))
