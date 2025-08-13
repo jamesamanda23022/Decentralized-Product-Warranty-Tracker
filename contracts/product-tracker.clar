@@ -569,3 +569,276 @@
             (merge tier-info {base-price: new-base-price}))
         
         (ok true)))
+
+;; Performance Analytics & Reputation System
+;; Tracks manufacturer performance metrics and customer satisfaction
+
+(define-constant RATING_EXCELLENT u5)
+(define-constant RATING_GOOD u4)
+(define-constant RATING_AVERAGE u3)
+(define-constant RATING_POOR u2)
+(define-constant RATING_TERRIBLE u1)
+
+(define-constant RESOLUTION_FAST u24) ;; 24 blocks or less
+(define-constant RESOLUTION_NORMAL u168) ;; 168 blocks (1 week)
+(define-constant RESOLUTION_SLOW u1008) ;; 1008 blocks (6 weeks)
+
+;; Manufacturer performance metrics
+(define-map manufacturer-performance
+    principal
+    {
+        total-claims-processed: uint,
+        claims-approved: uint,
+        claims-rejected: uint,
+        average-resolution-time: uint,
+        total-warranties-issued: uint,
+        customer-ratings-sum: uint,
+        total-ratings-count: uint,
+        reputation-score: uint,
+        last-updated: uint
+    })
+
+;; Individual claim performance tracking
+(define-map claim-performance
+    uint
+    {
+        processing-time: uint,
+        resolution-quality: uint,
+        customer-satisfaction: (optional uint),
+        performance-recorded: bool
+    })
+
+;; Customer feedback on resolved claims
+(define-map customer-feedback
+    uint
+    {
+        warranty-id: uint,
+        customer: principal,
+        manufacturer: principal,
+        service-rating: uint,
+        resolution-rating: uint,
+        feedback-text: (string-utf8 500),
+        submitted-date: uint
+    })
+
+;; Monthly manufacturer rankings for transparency
+(define-map monthly-rankings
+    uint ;; month identifier (block-height / 4320)
+    (list 20 {manufacturer: principal, score: uint}))
+
+;; Read-only functions for analytics
+(define-read-only (get-manufacturer-performance (manufacturer principal))
+    (map-get? manufacturer-performance manufacturer))
+
+(define-read-only (get-claim-performance (claim-id uint))
+    (map-get? claim-performance claim-id))
+
+(define-read-only (get-customer-feedback (claim-id uint))
+    (map-get? customer-feedback claim-id))
+
+(define-read-only (get-monthly-rankings (month uint))
+    (map-get? monthly-rankings month))
+
+(define-read-only (calculate-reputation-score 
+    (total-claims uint) 
+    (approved-claims uint) 
+    (avg-resolution-time uint) 
+    (avg-customer-rating uint))
+    (let
+        ((approval-rate (if (> total-claims u0) (* (/ approved-claims total-claims) u100) u0))
+         (resolution-bonus (if (<= avg-resolution-time RESOLUTION_FAST) u20
+                            (if (<= avg-resolution-time RESOLUTION_NORMAL) u10 u0)))
+         (rating-score (* avg-customer-rating u15))
+         (base-score (+ approval-rate resolution-bonus rating-score)))
+        (if (> base-score u100) u100 base-score)))
+
+(define-read-only (get-manufacturer-reputation-rank (manufacturer principal))
+    (match (map-get? manufacturer-performance manufacturer)
+        perf-data (get reputation-score perf-data)
+        u0))
+
+;; Update claim performance when processing warranty claims
+(define-private (update-claim-performance (claim-id uint) (processing-time uint))
+    (let
+        ((quality-score (if (<= processing-time RESOLUTION_FAST) u5
+                         (if (<= processing-time RESOLUTION_NORMAL) u3 u1))))
+        (map-set claim-performance claim-id
+            {
+                processing-time: processing-time,
+                resolution-quality: quality-score,
+                customer-satisfaction: none,
+                performance-recorded: true
+            })
+        true))
+
+;; Enhanced claim processing with performance tracking
+(define-public (process-warranty-claim-with-analytics
+    (claim-id uint)
+    (approve bool)
+    (resolution-notes (string-utf8 500)))
+    (let
+        ((claim-info (unwrap! (map-get? warranty-claims claim-id) (err u21)))
+         (warranty-info (unwrap! (map-get? warranty-details (get warranty-id claim-info)) (err u2)))
+         (manufacturer (get manufacturer warranty-info))
+         (processing-time (- stacks-block-height (get filed-date claim-info)))
+         (new-status (if approve CLAIM_STATUS_APPROVED CLAIM_STATUS_REJECTED))
+         (current-perf (default-to 
+            {total-claims-processed: u0, claims-approved: u0, claims-rejected: u0,
+             average-resolution-time: u0, total-warranties-issued: u0,
+             customer-ratings-sum: u0, total-ratings-count: u0,
+             reputation-score: u0, last-updated: u0}
+            (map-get? manufacturer-performance manufacturer))))
+        
+        (asserts! (is-eq tx-sender manufacturer) (err u8))
+        (asserts! (is-eq (get status claim-info) CLAIM_STATUS_PENDING) (err u22))
+        
+        ;; Process the claim
+        (map-set warranty-claims claim-id
+            (merge claim-info {
+                status: new-status,
+                processed-date: (some stacks-block-height),
+                processor: (some tx-sender),
+                resolution-notes: (some resolution-notes)
+            }))
+        
+        ;; Update performance metrics
+        (update-claim-performance claim-id processing-time)
+        
+        ;; Update manufacturer performance data
+        (let
+            ((new-total-claims (+ (get total-claims-processed current-perf) u1))
+             (new-approved (if approve (+ (get claims-approved current-perf) u1) 
+                            (get claims-approved current-perf)))
+             (new-rejected (if approve (get claims-rejected current-perf)
+                            (+ (get claims-rejected current-perf) u1)))
+             (current-avg (get average-resolution-time current-perf))
+             (new-avg-time (if (> new-total-claims u1)
+                            (/ (+ (* current-avg (- new-total-claims u1)) processing-time) new-total-claims)
+                            processing-time))
+             (current-ratings (get total-ratings-count current-perf))
+             (avg-rating (if (> current-ratings u0)
+                          (/ (get customer-ratings-sum current-perf) current-ratings) u3))
+             (new-reputation (calculate-reputation-score new-total-claims new-approved new-avg-time avg-rating)))
+            
+            (map-set manufacturer-performance manufacturer
+                (merge current-perf {
+                    total-claims-processed: new-total-claims,
+                    claims-approved: new-approved,
+                    claims-rejected: new-rejected,
+                    average-resolution-time: new-avg-time,
+                    reputation-score: new-reputation,
+                    last-updated: stacks-block-height
+                })))
+        
+        (ok true)))
+
+;; Customer feedback submission
+(define-public (submit-customer-feedback
+    (claim-id uint)
+    (service-rating uint)
+    (resolution-rating uint)
+    (feedback-text (string-utf8 500)))
+    (let
+        ((claim-info (unwrap! (map-get? warranty-claims claim-id) (err u21)))
+         (warranty-info (unwrap! (map-get? warranty-details (get warranty-id claim-info)) (err u2)))
+         (manufacturer (get manufacturer warranty-info))
+         (current-perf (unwrap! (map-get? manufacturer-performance manufacturer) (err u41))))
+        
+        (asserts! (is-eq tx-sender (get claimant claim-info)) (err u42))
+        (asserts! (is-eq (get status claim-info) CLAIM_STATUS_COMPLETED) (err u43))
+        (asserts! (and (>= service-rating u1) (<= service-rating u5)) (err u44))
+        (asserts! (and (>= resolution-rating u1) (<= resolution-rating u5)) (err u45))
+        (asserts! (is-none (get customer-satisfaction (default-to 
+            {processing-time: u0, resolution-quality: u0, customer-satisfaction: none, performance-recorded: false}
+            (map-get? claim-performance claim-id)))) (err u46))
+        
+        ;; Store feedback
+        (map-set customer-feedback claim-id
+            {
+                warranty-id: (get warranty-id claim-info),
+                customer: tx-sender,
+                manufacturer: manufacturer,
+                service-rating: service-rating,
+                resolution-rating: resolution-rating,
+                feedback-text: feedback-text,
+                submitted-date: stacks-block-height
+            })
+        
+        ;; Update claim performance with customer satisfaction
+        (let
+            ((claim-perf (unwrap! (map-get? claim-performance claim-id) (err u47)))
+             (combined-rating (/ (+ service-rating resolution-rating) u2)))
+            
+            (map-set claim-performance claim-id
+                (merge claim-perf {customer-satisfaction: (some combined-rating)}))
+            
+            ;; Update manufacturer performance with new rating
+            (let
+                ((new-ratings-sum (+ (get customer-ratings-sum current-perf) combined-rating))
+                 (new-ratings-count (+ (get total-ratings-count current-perf) u1))
+                 (new-avg-rating (/ new-ratings-sum new-ratings-count))
+                 (new-reputation (calculate-reputation-score 
+                    (get total-claims-processed current-perf)
+                    (get claims-approved current-perf)
+                    (get average-resolution-time current-perf)
+                    new-avg-rating)))
+                
+                (map-set manufacturer-performance manufacturer
+                    (merge current-perf {
+                        customer-ratings-sum: new-ratings-sum,
+                        total-ratings-count: new-ratings-count,
+                        reputation-score: new-reputation,
+                        last-updated: stacks-block-height
+                    }))))
+        
+        (ok true)))
+
+;; Initialize manufacturer performance when registering first product
+(define-public (initialize-manufacturer-performance (manufacturer principal))
+    (begin
+        (asserts! (is-none (map-get? manufacturer-performance manufacturer)) (err u48))
+        (map-set manufacturer-performance manufacturer
+            {
+                total-claims-processed: u0,
+                claims-approved: u0,
+                claims-rejected: u0,
+                average-resolution-time: u0,
+                total-warranties-issued: u1,
+                customer-ratings-sum: u0,
+                total-ratings-count: u0,
+                reputation-score: u50, ;; Start with neutral score
+                last-updated: stacks-block-height
+            })
+        (ok true)))
+
+;; Enhanced product registration with performance tracking
+(define-public (register-product-with-analytics
+    (product-id (string-ascii 64))
+    (product-name (string-ascii 64))
+    (product-serial (string-ascii 64))
+    (warranty-duration uint)
+    (warranty-terms (string-utf8 256))
+    (transferable bool))
+    (let
+        ((warranty-result (try! (register-product product-id product-name product-serial 
+                                  warranty-duration warranty-terms transferable)))
+         (current-perf (map-get? manufacturer-performance tx-sender)))
+        
+        ;; Initialize performance tracking if this is manufacturer's first product
+        (if (is-none current-perf)
+            (try! (initialize-manufacturer-performance tx-sender))
+            ;; Otherwise increment warranty count
+            (map-set manufacturer-performance tx-sender
+                (merge (unwrap-panic current-perf) 
+                    {total-warranties-issued: (+ (get total-warranties-issued (unwrap-panic current-perf)) u1)})))
+        
+        (ok warranty-result)))
+
+
+
+
+
+
+
+
+
