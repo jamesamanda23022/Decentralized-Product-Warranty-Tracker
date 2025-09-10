@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/product-tracker.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.WarrantyInsurance]
+path = 'contracts/WarrantyInsurance.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
